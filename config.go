@@ -25,8 +25,9 @@ type ConfigMapData struct {
 
 // ConfigMapMount represents a ConfigMap and its data to be mounted in a container.
 type ConfigMapMount struct {
-	Name string          `yaml:"name"`
-	Data []ConfigMapData `yaml:"data"`
+	Name       string          `yaml:"name"`
+	SourceType string          `yaml:"sourceType"`
+	Data       []ConfigMapData `yaml:"data"`
 }
 
 // ContainerConfig represents a container and its ConfigMap mounts.
@@ -109,7 +110,7 @@ func (c *DeploymentConfig) Validate() error {
 			errs = append(errs, fmt.Sprintf("duplicate deployment %q", deploymentKey))
 		}
 		deploymentSeen[deploymentKey] = struct{}{}
-		deploymentConfigMapDataSeen := make(map[string]map[string]string)
+		deploymentSourceDataSeen := make(map[string]map[string]string)
 
 		containerSeen := make(map[string]struct{}, len(deployment.Containers))
 		for ci := range deployment.Containers {
@@ -128,6 +129,13 @@ func (c *DeploymentConfig) Validate() error {
 			for mi := range container.ConfigMaps {
 				configMap := &container.ConfigMaps[mi]
 				configMap.Name = strings.TrimSpace(configMap.Name)
+				configMap.SourceType = strings.TrimSpace(configMap.SourceType)
+				if configMap.SourceType == "" {
+					configMap.SourceType = "ConfigMap"
+				}
+				if configMap.SourceType != "ConfigMap" && configMap.SourceType != "Secret" {
+					errs = append(errs, fmt.Sprintf("unsupported sourceType %q in deployment %q container %q source %q (allowed: ConfigMap, Secret)", configMap.SourceType, deploymentKey, container.Name, configMap.Name))
+				}
 				if configMap.Name == "" {
 					errs = append(errs, fmt.Sprintf("deployments[%d].containers[%d].configMaps[%d].name is required", di, ci, mi))
 				}
@@ -176,12 +184,13 @@ func (c *DeploymentConfig) Validate() error {
 					continue
 				}
 
-				if previousData, exists := deploymentConfigMapDataSeen[configMap.Name]; exists {
+				sourceKey := configMap.SourceType + ":" + configMap.Name
+				if previousData, exists := deploymentSourceDataSeen[sourceKey]; exists {
 					if !mapsEqual(previousData, configMapData) {
-						errs = append(errs, fmt.Sprintf("configMap %q has conflicting data definitions between containers in deployment %q", configMap.Name, deploymentKey))
+						errs = append(errs, fmt.Sprintf("source %q has conflicting data definitions between containers in deployment %q", sourceKey, deploymentKey))
 					}
 				} else {
-					deploymentConfigMapDataSeen[configMap.Name] = cloneStringMap(configMapData)
+					deploymentSourceDataSeen[sourceKey] = cloneStringMap(configMapData)
 				}
 			}
 		}

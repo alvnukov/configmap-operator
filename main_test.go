@@ -207,3 +207,28 @@ func TestEnsureConfigMapVolume_ReplacesNonConfigMapSource(t *testing.T) {
 		t.Fatalf("expected second call to be idempotent")
 	}
 }
+
+func TestEnsureSourceVolume_Secret(t *testing.T) {
+	volumes := []corev1.Volume{}
+	source := ConfigMapMount{
+		Name:       "app-secret",
+		SourceType: "Secret",
+		Data:       []ConfigMapData{{Key: "token", SubPath: "token"}},
+	}
+	items := []corev1.KeyToPath{{Key: "token", Path: "token"}}
+
+	if !ensureSourceVolume(&volumes, source, items) {
+		t.Fatalf("expected ensureSourceVolume to add secret volume")
+	}
+
+	if len(volumes) != 1 || volumes[0].VolumeSource.Secret == nil {
+		t.Fatalf("expected secret volume, got %#v", volumes)
+	}
+	if volumes[0].VolumeSource.Secret.SecretName != "app-secret" {
+		t.Fatalf("unexpected secret name: %q", volumes[0].VolumeSource.Secret.SecretName)
+	}
+
+	if ensureSourceVolume(&volumes, source, items) {
+		t.Fatalf("expected idempotent ensureSourceVolume call")
+	}
+}

@@ -1,0 +1,26 @@
+apiVersion: operator.alvnukov.dev/v1alpha1
+kind: WorkloadMountConfig
+metadata:
+  name: configmap-operator
+  namespace: default
+spec:
+  deployments:
+    - namespace: default
+      name: sample-app
+      containers:
+        - name: app
+          sources:
+            - type: ConfigMap
+              name: app-config
+              items:
+                - key: app.conf
+                  value: version=1
+                  mountPath: /etc/config/app.conf
+                  subPath: app.conf
+            - type: Secret
+              name: app-secret
+              items:
+                - key: token
+                  value: super-secret-token
+                  mountPath: /etc/secret/token
+                  subPath: token

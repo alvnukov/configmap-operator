@@ -5,6 +5,7 @@ import (
 	"fmt"
 	"sort"
 	"strconv"
+	"sync"
 	"time"
 
 	"go.uber.org/zap"
@@ -12,6 +13,9 @@ import (
 	corev1 "k8s.io/api/core/v1"
 	kerrors "k8s.io/apimachinery/pkg/api/errors"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
+	"k8s.io/apimachinery/pkg/fields"
+	"k8s.io/client-go/dynamic"
+	"k8s.io/client-go/dynamic/dynamicinformer"
 	"k8s.io/client-go/informers"
 	"k8s.io/client-go/kubernetes"
 	"k8s.io/client-go/kubernetes/scheme"
@@ -33,10 +37,15 @@ const (
 
 // Controller is the operator controller.
 type Controller struct {
-	clientset kubernetes.Interface
-	logger    *zap.Logger
-	config    *DeploymentConfig
-	queue     workqueue.RateLimitingInterface
+	clientset          kubernetes.Interface
+	dynamicClient      dynamic.Interface
+	logger             *zap.Logger
+	config             *DeploymentConfig
+	configMu           sync.RWMutex
+	configCRDNamespace string
+	configCRDName      string
+	manageConfigMaps   bool
+	queue              workqueue.RateLimitingInterface
 }
 
 // NewController creates a new controller from YAML config file.
@@ -53,14 +62,50 @@ func NewController(clientset kubernetes.Interface, logger *zap.Logger, configFil
 	return NewControllerWithConfig(clientset, logger, config), nil
 }
 
+// NewControllerFromCRD creates a new controller using WorkloadMountConfig as source of truth.
+func NewControllerFromCRD(clientset kubernetes.Interface, dynamicClient dynamic.Interface, logger *zap.Logger, namespace, name string) (*Controller, error) {
+	if err := scheme.AddToScheme(scheme.Scheme); err != nil {
+		return nil, fmt.Errorf("failed to register client-go scheme: %w", err)
+	}
+
+	config, err := LoadConfigFromCRD(context.Background(), dynamicClient, namespace, name)
+	if err != nil {
+		return nil, fmt.Errorf("failed to load configuration from CRD: %w", err)
+	}
+
+	return &Controller{
+		clientset:          clientset,
+		dynamicClient:      dynamicClient,
+		logger:             logger,
+		config:             config,
+		configCRDNamespace: namespace,
+		configCRDName:      name,
+		manageConfigMaps:   true,
+		queue:              workqueue.NewNamedRateLimitingQueue(workqueue.DefaultControllerRateLimiter(), deploymentQueueName),
+	}, nil
+}
+
 // NewControllerWithConfig creates a new controller from in-memory config.
 func NewControllerWithConfig(clientset kubernetes.Interface, logger *zap.Logger, config *DeploymentConfig) *Controller {
 	return &Controller{
-		clientset: clientset,
-		logger:    logger,
-		config:    config,
-		queue:     workqueue.NewNamedRateLimitingQueue(workqueue.DefaultControllerRateLimiter(), deploymentQueueName),
+		clientset:        clientset,
+		logger:           logger,
+		config:           config,
+		manageConfigMaps: true,
+		queue:            workqueue.NewNamedRateLimitingQueue(workqueue.DefaultControllerRateLimiter(), deploymentQueueName),
 	}
+}
+
+func (c *Controller) getConfig() *DeploymentConfig {
+	c.configMu.RLock()
+	defer c.configMu.RUnlock()
+	return c.config
+}
+
+func (c *Controller) setConfig(cfg *DeploymentConfig) {
+	c.configMu.Lock()
+	defer c.configMu.Unlock()
+	c.config = cfg
 }
 
 // Run starts informers and workers.
@@ -87,6 +132,12 @@ func (c *Controller) Run(ctx context.Context) error {
 		return fmt.Errorf("failed to add deployment event handlers: %w", err)
 	}
 
+	if c.dynamicClient != nil && c.configCRDNamespace != "" && c.configCRDName != "" {
+		if err := c.setupConfigCRDInformer(ctx); err != nil {
+			return err
+		}
+	}
+
 	sharedInformerFactory.Start(ctx.Done())
 
 	if !cache.WaitForCacheSync(ctx.Done(), deploymentInformer.HasSynced) {
@@ -106,7 +157,12 @@ func (c *Controller) Run(ctx context.Context) error {
 }
 
 func (c *Controller) enqueueConfiguredDeployments() {
-	for _, deployment := range c.config.Deployments {
+	cfg := c.getConfig()
+	if cfg == nil {
+		return
+	}
+
+	for _, deployment := range cfg.Deployments {
 		key := deployment.Namespace + "/" + deployment.Name
 		c.queue.Add(key)
 	}
@@ -170,7 +226,12 @@ func (c *Controller) reconcileKey(ctx context.Context, key string) error {
 		return fmt.Errorf("invalid queue key %q: %w", key, err)
 	}
 
-	deployment, found := c.config.FindDeployment(namespace, name)
+	cfg := c.getConfig()
+	if cfg == nil {
+		return nil
+	}
+
+	deployment, found := cfg.FindDeployment(namespace, name)
 	if !found {
 		return nil
 	}
@@ -183,9 +244,13 @@ func (c *Controller) reconcileDeployment(ctx context.Context, deploymentInfo *De
 		return nil
 	}
 
-	configMapsChanged, err := c.reconcileConfigMaps(ctx, deploymentInfo)
-	if err != nil {
-		return err
+	configMapsChanged := false
+	var err error
+	if c.manageConfigMaps {
+		configMapsChanged, err = c.reconcileConfigMaps(ctx, deploymentInfo)
+		if err != nil {
+			return err
+		}
 	}
 
 	desiredHash := desiredDeploymentHash(deploymentInfo)
@@ -291,12 +356,12 @@ func (c *Controller) applyDeploymentConfig(deployment *appsv1.Deployment, deploy
 
 		for _, configMap := range containerConfig.ConfigMaps {
 			desiredItems := buildConfigMapItems(configMap.Data, c.logger, deployment.Namespace, deployment.Name, configMap.Name)
-			if ensureConfigMapVolume(&deployment.Spec.Template.Spec.Volumes, configMap.Name, desiredItems) {
+			if ensureSourceVolume(&deployment.Spec.Template.Spec.Volumes, configMap, desiredItems) {
 				changesMade = true
 			}
 
 			for _, data := range configMap.Data {
-				if !hasConfigMapVolumeMount(container.VolumeMounts, configMap.Name, data.MountPath, data.SubPath) {
+				if !hasSourceVolumeMount(container.VolumeMounts, configMap.Name, data.MountPath, data.SubPath) {
 					mount := corev1.VolumeMount{
 						Name:      configMap.Name,
 						MountPath: data.MountPath,
@@ -356,22 +421,42 @@ func buildConfigMapItems(data []ConfigMapData, logger *zap.Logger, namespace, de
 	return items
 }
 
-func ensureConfigMapVolume(volumes *[]corev1.Volume, configMapName string, desiredItems []corev1.KeyToPath) bool {
-	desiredSource := corev1.VolumeSource{
-		ConfigMap: &corev1.ConfigMapVolumeSource{
-			LocalObjectReference: corev1.LocalObjectReference{Name: configMapName},
+func ensureSourceVolume(volumes *[]corev1.Volume, source ConfigMapMount, desiredItems []corev1.KeyToPath) bool {
+	sourceType := source.SourceType
+	if sourceType == "" {
+		sourceType = "ConfigMap"
+	}
+	sourceName := source.Name
+
+	desiredSource := corev1.VolumeSource{}
+	switch sourceType {
+	case "Secret":
+		desiredSource.Secret = &corev1.SecretVolumeSource{
+			SecretName: sourceName,
+			Items:      cloneKeyToPathSlice(desiredItems),
+		}
+	default:
+		desiredSource.ConfigMap = &corev1.ConfigMapVolumeSource{
+			LocalObjectReference: corev1.LocalObjectReference{Name: sourceName},
 			Items:                cloneKeyToPathSlice(desiredItems),
-		},
+		}
 	}
 
 	for i := range *volumes {
 		volume := &(*volumes)[i]
-		if volume.Name != configMapName {
+		if volume.Name != sourceName {
 			continue
 		}
 
-		if volume.VolumeSource.ConfigMap != nil &&
-			volume.VolumeSource.ConfigMap.LocalObjectReference.Name == configMapName &&
+		if sourceType == "Secret" &&
+			volume.VolumeSource.Secret != nil &&
+			volume.VolumeSource.Secret.SecretName == sourceName &&
+			keyToPathSlicesEqual(volume.VolumeSource.Secret.Items, desiredItems) {
+			return false
+		}
+		if sourceType != "Secret" &&
+			volume.VolumeSource.ConfigMap != nil &&
+			volume.VolumeSource.ConfigMap.LocalObjectReference.Name == sourceName &&
 			keyToPathSlicesEqual(volume.VolumeSource.ConfigMap.Items, desiredItems) {
 			return false
 		}
@@ -381,10 +466,14 @@ func ensureConfigMapVolume(volumes *[]corev1.Volume, configMapName string, desir
 	}
 
 	*volumes = append(*volumes, corev1.Volume{
-		Name:         configMapName,
+		Name:         sourceName,
 		VolumeSource: desiredSource,
 	})
 	return true
+}
+
+func ensureConfigMapVolume(volumes *[]corev1.Volume, configMapName string, desiredItems []corev1.KeyToPath) bool {
+	return ensureSourceVolume(volumes, ConfigMapMount{Name: configMapName, SourceType: "ConfigMap"}, desiredItems)
 }
 
 func keyToPathSlicesEqual(a, b []corev1.KeyToPath) bool {
@@ -408,13 +497,17 @@ func cloneKeyToPathSlice(items []corev1.KeyToPath) []corev1.KeyToPath {
 	return out
 }
 
-func hasConfigMapVolumeMount(volumeMounts []corev1.VolumeMount, configMapName, mountPath, subPath string) bool {
+func hasSourceVolumeMount(volumeMounts []corev1.VolumeMount, sourceName, mountPath, subPath string) bool {
 	for _, vm := range volumeMounts {
-		if vm.Name == configMapName && vm.MountPath == mountPath && vm.SubPath == subPath {
+		if vm.Name == sourceName && vm.MountPath == mountPath && vm.SubPath == subPath {
 			return true
 		}
 	}
 	return false
+}
+
+func hasConfigMapVolumeMount(volumeMounts []corev1.VolumeMount, configMapName, mountPath, subPath string) bool {
+	return hasSourceVolumeMount(volumeMounts, configMapName, mountPath, subPath)
 }
 
 func ensurePodTemplateAnnotation(deployment *appsv1.Deployment, key, value string) bool {
@@ -438,8 +531,17 @@ func (c *Controller) UpdateConfigMapIfMismatch(namespace, name string, data map[
 
 // CheckAndUpdateConfigMapsFromConfig checks ConfigMaps against config and updates drift.
 func (c *Controller) CheckAndUpdateConfigMapsFromConfig() error {
-	for i := range c.config.Deployments {
-		if _, err := c.reconcileConfigMaps(context.Background(), &c.config.Deployments[i]); err != nil {
+	if !c.manageConfigMaps {
+		return nil
+	}
+
+	cfg := c.getConfig()
+	if cfg == nil {
+		return nil
+	}
+
+	for i := range cfg.Deployments {
+		if _, err := c.reconcileConfigMaps(context.Background(), &cfg.Deployments[i]); err != nil {
 			return err
 		}
 	}
@@ -447,27 +549,109 @@ func (c *Controller) CheckAndUpdateConfigMapsFromConfig() error {
 	return nil
 }
 
+func (c *Controller) setupConfigCRDInformer(ctx context.Context) error {
+	factory := dynamicinformer.NewFilteredDynamicSharedInformerFactory(
+		c.dynamicClient,
+		resyncPeriod,
+		c.configCRDNamespace,
+		func(options *metav1.ListOptions) {
+			options.FieldSelector = fields.OneTermEqualSelector("metadata.name", c.configCRDName).String()
+		},
+	)
+
+	informer := factory.ForResource(configGVR).Informer()
+	_, err := informer.AddEventHandler(cache.ResourceEventHandlerFuncs{
+		AddFunc: func(_ interface{}) {
+			c.reloadConfigFromCRD(ctx)
+			c.enqueueConfiguredDeployments()
+		},
+		UpdateFunc: func(_, _ interface{}) {
+			c.reloadConfigFromCRD(ctx)
+			c.enqueueConfiguredDeployments()
+		},
+		DeleteFunc: func(_ interface{}) {
+			c.logger.Warn("Configuration CRD was deleted; keeping last known valid configuration",
+				zap.String("namespace", c.configCRDNamespace),
+				zap.String("name", c.configCRDName),
+			)
+		},
+	})
+	if err != nil {
+		return fmt.Errorf("failed to add WorkloadMountConfig event handlers: %w", err)
+	}
+
+	factory.Start(ctx.Done())
+	if !cache.WaitForCacheSync(ctx.Done(), informer.HasSynced) {
+		return fmt.Errorf("timed out waiting for WorkloadMountConfig cache to sync")
+	}
+
+	return nil
+}
+
+func (c *Controller) reloadConfigFromCRD(ctx context.Context) {
+	reloadCtx, cancel := context.WithTimeout(ctx, requestTimeout)
+	defer cancel()
+
+	cfg, err := LoadConfigFromCRD(reloadCtx, c.dynamicClient, c.configCRDNamespace, c.configCRDName)
+	if err != nil {
+		c.logger.Error("Failed to reload config from CRD; keeping last known valid config",
+			zap.String("namespace", c.configCRDNamespace),
+			zap.String("name", c.configCRDName),
+			zap.Error(err),
+		)
+		return
+	}
+
+	c.setConfig(cfg)
+	c.logger.Info("Configuration reloaded from CRD",
+		zap.String("namespace", c.configCRDNamespace),
+		zap.String("name", c.configCRDName),
+		zap.Int("deployments", len(cfg.Deployments)),
+	)
+}
+
 func (c *Controller) reconcileConfigMaps(ctx context.Context, deploymentInfo *DeploymentInfo) (bool, error) {
 	if deploymentInfo == nil {
 		return false, nil
 	}
 
-	desiredByName := make(map[string]map[string]string)
+	desiredConfigMapsByName := make(map[string]map[string]string)
+	desiredSecretsByName := make(map[string]map[string]string)
 	for _, container := range deploymentInfo.Containers {
-		for _, configMap := range container.ConfigMaps {
-			desiredByName[configMap.Name] = getConfigMapData(configMap)
+		for _, source := range container.ConfigMaps {
+			switch source.SourceType {
+			case "Secret":
+				desiredSecretsByName[source.Name] = getConfigMapData(source)
+			default:
+				desiredConfigMapsByName[source.Name] = getConfigMapData(source)
+			}
 		}
 	}
 
-	names := make([]string, 0, len(desiredByName))
-	for name := range desiredByName {
-		names = append(names, name)
+	configMapNames := make([]string, 0, len(desiredConfigMapsByName))
+	for name := range desiredConfigMapsByName {
+		configMapNames = append(configMapNames, name)
 	}
-	sort.Strings(names)
+	sort.Strings(configMapNames)
+
+	secretNames := make([]string, 0, len(desiredSecretsByName))
+	for name := range desiredSecretsByName {
+		secretNames = append(secretNames, name)
+	}
+	sort.Strings(secretNames)
 
 	anyChanges := false
-	for _, name := range names {
-		updated, err := c.ensureConfigMap(ctx, deploymentInfo.Namespace, name, desiredByName[name])
+	for _, name := range configMapNames {
+		updated, err := c.ensureConfigMap(ctx, deploymentInfo.Namespace, name, desiredConfigMapsByName[name])
+		if err != nil {
+			return false, err
+		}
+		if updated {
+			anyChanges = true
+		}
+	}
+	for _, name := range secretNames {
+		updated, err := c.ensureSecret(ctx, deploymentInfo.Namespace, name, desiredSecretsByName[name])
 		if err != nil {
 			return false, err
 		}
@@ -477,6 +661,120 @@ func (c *Controller) reconcileConfigMaps(ctx context.Context, deploymentInfo *De
 	}
 
 	return anyChanges, nil
+}
+
+func (c *Controller) ensureSecret(ctx context.Context, namespace, name string, desiredData map[string]string) (bool, error) {
+	if name == "" {
+		return false, fmt.Errorf("secret name is empty")
+	}
+
+	changed := false
+	desiredSecretData := make(map[string][]byte, len(desiredData))
+	for key, value := range desiredData {
+		desiredSecretData[key] = []byte(value)
+	}
+
+	err := retry.RetryOnConflict(retry.DefaultBackoff, func() error {
+		getCtx, cancelGet := context.WithTimeout(ctx, requestTimeout)
+		secret, getErr := c.clientset.CoreV1().Secrets(namespace).Get(getCtx, name, metav1.GetOptions{})
+		cancelGet()
+		if getErr != nil {
+			if !kerrors.IsNotFound(getErr) {
+				return getErr
+			}
+
+			createCtx, cancelCreate := context.WithTimeout(ctx, requestTimeout)
+			_, createErr := c.clientset.CoreV1().Secrets(namespace).Create(createCtx, &corev1.Secret{
+				ObjectMeta: metav1.ObjectMeta{
+					Name:      name,
+					Namespace: namespace,
+					Labels: map[string]string{
+						managedByLabelKey: managedByLabelValue,
+					},
+				},
+				Type: corev1.SecretTypeOpaque,
+				Data: cloneByteMap(desiredSecretData),
+			}, metav1.CreateOptions{})
+			cancelCreate()
+			if createErr != nil {
+				return createErr
+			}
+
+			changed = true
+			return nil
+		}
+
+		labels := cloneStringMap(secret.Labels)
+		if labels == nil {
+			labels = map[string]string{}
+		}
+		if labels[managedByLabelKey] != managedByLabelValue {
+			labels[managedByLabelKey] = managedByLabelValue
+		}
+
+		needsUpdate := !byteMapsEqual(secret.Data, desiredSecretData) || !mapsEqual(secret.Labels, labels)
+		if !needsUpdate {
+			return nil
+		}
+
+		mutableSecret := secret.DeepCopy()
+		mutableSecret.Data = cloneByteMap(desiredSecretData)
+		mutableSecret.Labels = labels
+		if mutableSecret.Type == "" {
+			mutableSecret.Type = corev1.SecretTypeOpaque
+		}
+
+		updateCtx, cancelUpdate := context.WithTimeout(ctx, requestTimeout)
+		_, updateErr := c.clientset.CoreV1().Secrets(namespace).Update(updateCtx, mutableSecret, metav1.UpdateOptions{})
+		cancelUpdate()
+		if updateErr != nil {
+			return updateErr
+		}
+
+		changed = true
+		return nil
+	})
+	if err != nil {
+		return false, fmt.Errorf("failed to reconcile Secret %s/%s: %w", namespace, name, err)
+	}
+
+	if changed {
+		c.logger.Info("Secret reconciled",
+			zap.String("namespace", namespace),
+			zap.String("name", name),
+		)
+	}
+
+	return changed, nil
+}
+
+func byteMapsEqual(a, b map[string][]byte) bool {
+	if len(a) != len(b) {
+		return false
+	}
+	for key, valueA := range a {
+		valueB, ok := b[key]
+		if !ok {
+			return false
+		}
+		if string(valueA) != string(valueB) {
+			return false
+		}
+	}
+	return true
+}
+
+func cloneByteMap(in map[string][]byte) map[string][]byte {
+	if in == nil {
+		return nil
+	}
+	out := make(map[string][]byte, len(in))
+	for key, value := range in {
+		copied := make([]byte, len(value))
+		copy(copied, value)
+		out[key] = copied
+	}
+	return out
 }
 
 func (c *Controller) ensureConfigMap(ctx context.Context, namespace, name string, desiredData map[string]string) (bool, error) {

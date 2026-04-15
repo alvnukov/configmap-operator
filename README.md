@@ -72,6 +72,12 @@
 
 - `-config` (default: `config.yaml`) — путь к YAML-конфигу оператора
 - `-kubeconfig` (default: `~/.kube/config`) — путь к kubeconfig для запуска вне кластера
+- `-config-crd-namespace` — namespace объекта `WorkloadMountConfig` (включает CRD-режим)
+- `-config-crd-name` — имя объекта `WorkloadMountConfig` (включает CRD-режим)
+
+Источник конфигурации:
+- file-mode (по умолчанию): используется `-config`;
+- crd-mode: если задан хотя бы один из `-config-crd-*`, должны быть заданы оба, и конфиг читается из CRD.
 
 Логика выбора Kubernetes-конфига:
 - сначала используется `-kubeconfig`;
@@ -111,6 +117,22 @@ go run . -config ./config.yaml
 ```bash
 go run . -kubeconfig ~/.kube/config -config ./config.yaml
 ```
+
+Запуск в CRD-режиме:
+
+```bash
+kubectl apply -f .helm/crds/workloadmountconfigs.operator.alvnukov.dev.yaml
+kubectl apply -f examples/workloadmountconfig.yaml
+
+go run . \
+  -kubeconfig ~/.kube/config \
+  -config-crd-namespace default \
+  -config-crd-name configmap-operator
+```
+
+В `crd-mode` оператор:
+- создает/обновляет `ConfigMap` и `Secret` из `spec.deployments[*].containers[*].sources[*].items[*].value`;
+- монтирует эти источники в target `Deployment` по `mountPath/subPath`.
 
 ## Конфигурация
 
@@ -301,16 +323,15 @@ Jobs:
 ### Publish (`.github/workflows/publish-image.yml`)
 
 Публикация образа запускается:
-- после успешного `CI` на `main` (`workflow_run`);
-- при push тега `v*`;
-- вручную (`workflow_dispatch`).
+- только при push тега `v*`.
 
 Что делает:
 - buildx multi-arch push в `ghcr.io/<owner>/<repo>`;
 - платформы: `linux/amd64`, `linux/arm64`, `linux/arm/v7`;
 - генерирует `sbom` и `provenance`;
 - подписывает образ keyless `cosign`;
-- выполняет `trivy` скан опубликованного digest.
+- выполняет `trivy` скан опубликованного digest;
+- создает GitHub Release для тега.
 
 ## Безопасность и supply chain
 
