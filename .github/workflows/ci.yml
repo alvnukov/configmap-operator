@@ -101,6 +101,7 @@ jobs:
           exit-code: 1
           format: sarif
           output: trivy-fs.sarif
+          limit-severities-for-sarif: true
           severity: HIGH,CRITICAL
           vuln-type: os,library
           ignore-unfixed: true
