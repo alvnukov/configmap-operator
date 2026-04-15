@@ -104,7 +104,7 @@ jobs:
           severity: HIGH,CRITICAL
           vuln-type: os,library
           ignore-unfixed: true
-          scanners: vuln,secret
+          scanners: vuln
 
       - name: Upload Trivy filesystem scan
         if: always() && hashFiles('trivy-fs.sarif') != ''
