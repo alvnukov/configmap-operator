@@ -87,6 +87,12 @@ jobs:
       - name: Enforce gosec
         run: /tmp/gosec ./...
 
+      - name: Prepare Helm dependencies for Trivy
+        run: |
+          helm repo add helm-apps https://alvnukov.github.io/helm-apps
+          helm repo update
+          helm dependency build .helm
+
       - name: Run Trivy filesystem scan
         uses: aquasecurity/trivy-action@v0.35.0
         with:
