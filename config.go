@@ -49,6 +49,7 @@ type DeploymentConfig struct {
 
 // LoadConfig loads and validates operator configuration from file.
 func LoadConfig(filename string) (*DeploymentConfig, error) {
+	// #nosec G304 -- configuration file path is an explicit operator CLI input.
 	data, err := os.ReadFile(filename)
 	if err != nil {
 		return nil, err
