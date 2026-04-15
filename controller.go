@@ -381,7 +381,7 @@ func ensureConfigMapVolume(volumes *[]corev1.Volume, configMapName string, desir
 	}
 
 	*volumes = append(*volumes, corev1.Volume{
-		Name: configMapName,
+		Name:         configMapName,
 		VolumeSource: desiredSource,
 	})
 	return true

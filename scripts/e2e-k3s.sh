@@ -56,6 +56,8 @@ EOF
 kubectl -n "${NAMESPACE}" rollout status deployment/sample-app --timeout=120s
 
 echo "[e2e] installing chart"
+helm repo add helm-apps https://alvnukov.github.io/helm-apps >/dev/null
+helm repo update >/dev/null
 helm dependency build "${ROOT_DIR}/.helm"
 helm upgrade --install "${RELEASE_NAME}" "${ROOT_DIR}/.helm" \
   --namespace "${NAMESPACE}" \
