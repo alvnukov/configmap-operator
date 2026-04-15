@@ -1,0 +1,6 @@
+dependencies:
+- name: helm-apps
+  repository: https://alvnukov.github.io/helm-apps
+  version: 1.8.11
+digest: sha256:1930e1bf62e71c9a7efcd32ed5f843f68e189796ac10abb872a1450086f82627
+generated: "2026-04-15T16:29:26.226891+03:00"

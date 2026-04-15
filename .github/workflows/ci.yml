@@ -1,0 +1,179 @@
+name: CI
+
+on:
+  pull_request:
+  push:
+    branches:
+      - main
+
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  go-tests:
+    name: Go Tests
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup Go
+        uses: actions/setup-go@v5
+        with:
+          go-version: "1.26.x"
+          cache: true
+
+      - name: Download dependencies
+        run: go mod download
+
+      - name: Check gofmt
+        run: |
+          UNFORMATTED="$(gofmt -l .)"
+          if [[ -n "${UNFORMATTED}" ]]; then
+            echo "The following files are not gofmt-formatted:"
+            echo "${UNFORMATTED}"
+            exit 1
+          fi
+
+      - name: Run go vet
+        run: go vet ./...
+
+      - name: Run unit tests
+        run: go test ./... -covermode=atomic -coverprofile=coverage.out
+
+  security-audit:
+    name: Security Audit
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      security-events: write
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup Go
+        uses: actions/setup-go@v5
+        with:
+          go-version: "1.26.x"
+          cache: true
+
+      - name: Download dependencies
+        run: go mod download
+
+      - name: Run govulncheck
+        run: |
+          go install golang.org/x/vuln/cmd/govulncheck@latest
+          govulncheck ./...
+
+      - name: Install gosec
+        run: |
+          GOSEC_VERSION=2.25.0
+          curl -sSL -o /tmp/gosec.tar.gz "https://github.com/securego/gosec/releases/download/v${GOSEC_VERSION}/gosec_${GOSEC_VERSION}_linux_amd64.tar.gz"
+          tar -xzf /tmp/gosec.tar.gz -C /tmp gosec
+
+      - name: Generate gosec SARIF
+        run: |
+          /tmp/gosec -no-fail -fmt sarif -out gosec.sarif ./...
+
+      - name: Upload gosec results
+        if: always()
+        uses: github/codeql-action/upload-sarif@v3
+        with:
+          sarif_file: gosec.sarif
+
+      - name: Enforce gosec
+        run: /tmp/gosec ./...
+
+      - name: Run Trivy filesystem scan
+        uses: aquasecurity/trivy-action@0.28.0
+        with:
+          scan-type: fs
+          scan-ref: .
+          exit-code: 1
+          format: sarif
+          output: trivy-fs.sarif
+          severity: HIGH,CRITICAL
+          vuln-type: os,library
+          ignore-unfixed: true
+          scanners: vuln,secret,misconfig
+
+      - name: Upload Trivy filesystem scan
+        if: always()
+        uses: github/codeql-action/upload-sarif@v3
+        with:
+          sarif_file: trivy-fs.sarif
+
+  helm-chart:
+    name: Helm Chart
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup Helm
+        uses: azure/setup-helm@v4
+
+      - name: Build chart dependencies
+        run: helm dependency build .helm
+
+      - name: Lint chart
+        run: helm lint .helm
+
+      - name: Render chart
+        run: helm template configmap-operator .helm --namespace e2e > /tmp/rendered.yaml
+
+      - name: Validate rendered manifests with kubeconform
+        run: |
+          curl -sSL -o /tmp/kubeconform.tar.gz https://github.com/yannh/kubeconform/releases/download/v0.6.7/kubeconform-linux-amd64.tar.gz
+          tar -xzf /tmp/kubeconform.tar.gz -C /tmp kubeconform
+          /tmp/kubeconform -summary -strict /tmp/rendered.yaml
+
+  e2e-k3s:
+    name: E2E on K3s
+    needs:
+      - go-tests
+      - helm-chart
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    permissions:
+      contents: read
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup kubectl
+        uses: azure/setup-kubectl@v4
+
+      - name: Setup Helm
+        uses: azure/setup-helm@v4
+
+      - name: Install k3d
+        run: |
+          curl -sSL -o /tmp/k3d https://github.com/k3d-io/k3d/releases/download/v5.7.5/k3d-linux-amd64
+          install -m 0755 /tmp/k3d /usr/local/bin/k3d
+          k3d version
+
+      - name: Create k3s cluster
+        run: |
+          k3d cluster create ci --agents 1 --wait --timeout 180s
+          kubectl cluster-info
+
+      - name: Build operator image for e2e
+        run: docker build -t ghcr.io/example/configmap-operator:e2e .
+
+      - name: Import image into k3s
+        run: k3d image import ghcr.io/example/configmap-operator:e2e -c ci
+
+      - name: Run e2e test
+        run: ./scripts/e2e-k3s.sh
+        env:
+          E2E_IMAGE: ghcr.io/example/configmap-operator:e2e
+
+      - name: Tear down k3s cluster
+        if: always()
+        run: k3d cluster delete ci

@@ -1,0 +1,21 @@
+apps-stateless:
+  configmap-operator:
+    containers:
+      main:
+        image:
+          staticTag: e2e
+        configFiles:
+          config.yaml:
+            content: |
+              deployments:
+                - namespace: e2e
+                  name: sample-app
+                  containers:
+                    - name: app
+                      configMaps:
+                        - name: e2e-config
+                          data:
+                            - key: app.conf
+                              value: version=1
+                              subPath: app.conf
+                              mountPath: /etc/config/app.conf

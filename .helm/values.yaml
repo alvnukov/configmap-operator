@@ -1,0 +1,61 @@
+global:
+  env: prod
+  labels:
+    addEnv: false
+  _includes:
+    apps-defaults:
+      enabled: false
+    apps-default-library-app:
+      _include: ["apps-defaults"]
+    apps-stateless-defaultApp:
+      _include: ["apps-default-library-app"]
+      service:
+        enabled: false
+        name: "{{ $.CurrentApp.name }}"
+
+apps-stateless:
+  configmap-operator:
+    _include: ["apps-stateless-defaultApp"]
+    enabled: true
+    replicas: 1
+
+    serviceAccount:
+      enabled: true
+      name: "{{ $.CurrentApp.name }}"
+      clusterRole:
+        name: "{{ $.Release.Namespace }}:{{ $.CurrentApp.name }}:controller"
+        rules: |
+          - apiGroups: [""]
+            resources: ["configmaps"]
+            verbs: ["get", "list", "watch", "create", "update", "patch"]
+          - apiGroups: ["apps"]
+            resources: ["deployments"]
+            verbs: ["get", "list", "watch", "update", "patch"]
+
+    containers:
+      main:
+        image:
+          repository: ghcr.io/example
+          name: configmap-operator
+          staticTag: latest
+
+        args: |
+          - -config
+          - /etc/configmap-operator/config.yaml
+
+        resources:
+          requests:
+            mcpu: 50
+            memoryMb: 64
+          limits:
+            mcpu: 250
+            memoryMb: 256
+
+        configFiles:
+          config.yaml:
+            mountPath: /etc/configmap-operator/config.yaml
+            content: |
+              deployments:
+              - namespace: default
+                name: placeholder
+                containers: []
