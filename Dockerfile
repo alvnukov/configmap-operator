@@ -1,9 +1,8 @@
 # syntax=docker/dockerfile:1.7
 
 ARG GO_VERSION=1.26.2
-ARG ALPINE_VERSION=3.20
 
-FROM --platform=$BUILDPLATFORM golang:${GO_VERSION}-alpine${ALPINE_VERSION} AS builder
+FROM --platform=$BUILDPLATFORM golang:${GO_VERSION} AS builder
 WORKDIR /src
 
 COPY go.mod go.sum ./
