@@ -37,7 +37,7 @@ apps-stateless:
         image:
           repository: ghcr.io/example
           name: configmap-operator
-          staticTag: latest
+          staticTag: "0.2.1"
 
         args: |
           - -config
